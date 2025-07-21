@@ -1,0 +1,80 @@
+# requirements.txt
+requests>=2.25.1
+beautifulsoup4>=4.9.3
+lxml>=4.6.3
+pandas>=1.3.3
+numpy>=1.21.0
+python-dateutil>=2.8.2
+tqdm>=4.62.0
+fake-useragent>=0.1.11
+
+# ====================
+# run_crawler.py
+# ====================
+
+#!/usr/bin/env python3
+"""
+Main runner script for Chinese media crawler
+"""
+
+import argparse
+import logging
+from pathlib import Path
+import sys
+
+# Add project root to path
+sys.path.append(str(Path(__file__).parent))
+
+from crawler_main import ChineseMediaCrawler
+from crawler_config import DataProcessor, CONFIG
+
+def setup_logging(log_level='INFO'):
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('crawler.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+def main():
+    parser = argparse.ArgumentParser(description='Chinese Official Media Crawler')
+    parser.add_argument('--media', nargs='+', 
+                       choices=['gmw', 'people', 'economic', 'reference'],
+                       default=['gmw', 'people'],
+                       help='Media outlets to crawl')
+    parser.add_argument('--start-year', type=int, default=1978,
+                       help='Start year for crawling')
+    parser.add_argument('--end-year', type=int, default=2019,
+                       help='End year for crawling')
+    parser.add_argument('--output-dir', default='data/raw',
+                       help='Output directory for raw data')
+    parser.add_argument('--log-level', default='INFO',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging level')
+    parser.add_argument('--process-only', action='store_true',
+                       help='Only process existing data, skip crawling')
+    parser.add_argument('--max-articles', type=int, default=1000,
+                       help='Maximum articles to crawl per media outlet')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(args.log_level)
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"Starting Chinese Media Crawler")
+    logger.info(f"Media outlets: {args.media}")
+    logger.info(f"Year range: {args.start_year} - {args.end_year}")
+    logger.info(f"Output directory: {args.output_dir}")
+    
+    if not args.process_only:
+        # Initialize and run crawler
+        crawler = ChineseMediaCrawler(output_dir=args.output_dir)
+        crawler.start_year = args.start_year
+        crawler.end_year = args.end_year
+        
+        try:
+            # Run the crawler
