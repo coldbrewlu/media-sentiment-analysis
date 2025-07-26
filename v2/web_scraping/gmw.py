@@ -42,8 +42,22 @@ def init_db():
     """Open a psycopg2 connection using our env-driven settings."""
     conn = psycopg2.connect(**DB_CONFIG)
     conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+          CREATE TABLE IF NOT EXISTS articles (
+            id          SERIAL PRIMARY KEY,
+            url         TEXT    NOT NULL UNIQUE,
+            title       TEXT,
+            date        DATE,
+            author      TEXT,
+            content     TEXT,
+            scraped_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        """
+        )
+    logger.info("Ensured articles table exists")
     return conn
-
 
 def article_exists(conn, url):
     """Return True if this URL is already in our shared 'articles' table."""
