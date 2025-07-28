@@ -12,6 +12,8 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import psycopg2.extras as extras
+from ..const.util import is_relevant_article
 
 load_dotenv()
 
@@ -79,6 +81,25 @@ def save_article(conn, rec):
         )
     logger.info("Saved → %s", rec["url"])
 
+def save_articles_batch(conn, records):
+    if not records:
+        return
+
+    tuples = [(r['url'], r['title'], r['date'], r['author'], r['content']) for r in records]
+    sql = """
+        INSERT INTO articles (url, title, date, author, content)
+        VALUES %s
+        ON CONFLICT (url) DO NOTHING
+    """
+    try:
+        with conn.cursor() as cur:
+            # cap the page_size to avoid too-large queries
+            page_size = min(len(records), 1000)
+            extras.execute_values(cur, sql, tuples, page_size=page_size)
+        logger.info("Batch-saved %d articles", len(records))
+    except Exception as e:
+        logger.error("Failed to batch-insert %d records: %s", len(records), e)
+        # Optional: retry in smaller chunks here…
 
 # ——— SCRAPING HELPERS ———————————————————————————————————
 def extract_list_articles(html):
@@ -127,27 +148,35 @@ def fetch_and_build(art):
         article_date = datetime.strptime(art["date"], "%Y-%m-%d").date()
     except ValueError:
         logger.warning(f"Skipping malformed date: {art['date']} → {art['link']}")
-        return None
+        return False, None
 
     try:
         author, content = fetch_detail(art["link"])
+        if not content: 
+            return (False, None)
+        if content and not is_relevant_article(content):
+            logger.debug("Article not relevant → %s", art["link"])
+            return (False, None)
     except Exception as e:
         logger.warning(f"Failed to fetch detail → {art['link']}: {e}")
-        return None
+        return False, None
 
-    return {
-        "url": art["link"],
-        "title": art["title"],
-        "date": article_date,
-        "author": author,
-        "content": content,
-    }
+    return (
+        True,
+        {
+            "url": art["link"],
+            "title": art["title"],
+            "date": article_date,
+            "author": author,
+            "content": content,
+        },
+    )
 
 
 # ——— MAIN SCRAPER —————————————————————————————————————
 def scrape_all():
     conn = init_db()
-    page = 10300
+    page = 23836
 
     while True:
         list_url = f"{BASE_URL}{PAGE_PARAM}{page}"
@@ -155,9 +184,9 @@ def scrape_all():
         r = requests.get(list_url, headers=HEADERS)
         r.encoding = "utf-8"
         r.raise_for_status()
-        
+
         articles = extract_list_articles(r.text)
-        
+
         # Filter first to avoid wasteful threads
         articles_to_fetch = []
         for art in articles:
@@ -169,24 +198,36 @@ def scrape_all():
                 logger.debug("Already exists → %s", art["link"])
                 continue
             articles_to_fetch.append(art)
-            
 
         if not articles:
             logger.info("No articles found on page %d; stopping.", page)
             break
         if not articles_to_fetch:
-            logger.info("No articles within date threshold on page %d.", page)
+            logger.info("No articles to fetch on page %d.", page)
             page += 1
             continue
-        
+
         logger.info("Fetching %d articles in parallel...", len(articles_to_fetch))
 
+        articles_to_save = []
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(fetch_and_build, art) for art in articles_to_fetch]
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Page {page}", unit="art"):
-                result = future.result()
-                if result:
-                    save_article(conn, result)
+            futures = [
+                executor.submit(fetch_and_build, art) for art in articles_to_fetch
+            ]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Page {page}",
+                unit="art",
+            ):
+                is_relevant, result = future.result()
+                if is_relevant and result:
+                    # save_article(conn, result)
+                    articles_to_save.append(result)
+        
+        if articles_to_save:
+            save_articles_batch(conn, articles_to_save)
+            logger.info("Saved %d articles from page %d", len(articles_to_save), page)
 
         page += 1
         time.sleep(DELAY)

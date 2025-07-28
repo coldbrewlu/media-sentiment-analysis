@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import requests
+import html
 import psycopg2
 from tqdm import tqdm
 import random
@@ -9,7 +10,9 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import psycopg2.extras as extras
 from dotenv import load_dotenv
+from ..const.util import is_relevant_article
 
 load_dotenv()
 
@@ -17,7 +20,7 @@ load_dotenv()
 BASE_URL = "https://epaper.gmw.cn/gmrb/html/"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 DATE_THRESHOLD = "2021-12-31"  # only scrape dates ≤ this cutoff
-MAX_WORKERS = 8  # number of threads for parallel fetching
+MAX_WORKERS = 16  # number of threads for parallel fetching
 DELAY = 1.0  # pause between days to be polite
 
 DB_CONFIG = {
@@ -81,6 +84,27 @@ def save_article(conn, rec):
             (rec["url"], rec["title"], rec["date"], rec["author"], rec["content"]),
         )
     logger.info("Saved → %s", rec["url"])
+    
+def save_articles_batch(conn, records):
+    if not records:
+        return
+
+    tuples = [(r['url'], r['title'], r['date'], r['author'], r['content']) for r in records]
+    sql = """
+        INSERT INTO articles (url, title, date, author, content)
+        VALUES %s
+        ON CONFLICT (url) DO NOTHING
+    """
+    try:
+        with conn.cursor() as cur:
+            # cap the page_size to avoid too-large queries
+            page_size = min(len(records), 1000)
+            extras.execute_values(cur, sql, tuples, page_size=page_size)
+        logger.info("Batch-saved %d articles", len(records))
+    except Exception as e:
+        logger.error("Failed to batch-insert %d records: %s", len(records), e)
+        # Optional: retry in smaller chunks here…
+
 
 
 # ——— SCRAPING FUNCTIONS ————————————————————————————————————————
@@ -95,7 +119,8 @@ def get_sections_for_date(date_str):
     r.encoding = "utf-8"
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    decoded_html = html.unescape(r.text)
+    soup = BeautifulSoup(decoded_html, "html.parser")
     sections = []
     for a in soup.select("div.list_r ul li a#pageLink"):
         title = a.get_text(strip=True)
@@ -113,7 +138,8 @@ def get_articles_in_section(section_url):
     r.encoding = "utf-8"
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    decoded_html = html.unescape(r.text)
+    soup = BeautifulSoup(decoded_html, "html.parser")
     articles = []
     for a in soup.select("div.list_l ul li a"):
         title = a.get_text(strip=True)
@@ -133,7 +159,8 @@ def fetch_article_detail(url):
     r.encoding = "utf-8"
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    decoded_html = html.unescape(r.text)
+    soup = BeautifulSoup(decoded_html, "html.parser")
     author_tag = soup.select_one("div.lai span")
     author = author_tag.get_text(strip=True).split("：", 1)[-1] if author_tag else None
 
@@ -142,6 +169,33 @@ def fetch_article_detail(url):
     texts = [p.get_text(strip=True) for p in paras if p.get_text(strip=True)]
     passage = "\n\n".join(texts)
     return author, passage
+
+def fetch_section(sec):
+    sec_title, sec_url = sec
+    try:
+        arts = get_articles_in_section(sec_url)
+        # tag each article with its section title
+        return [(sec_title, title, url) for title, url in arts]
+    except Exception as e:
+        logger.warning("Error fetching %s: %s", sec_url, e)
+        return []
+
+def filter_new_urls(conn, candidates):
+    """
+    Given a list of (sec_title, art_title, art_url),
+    return only those whose art_url is *not* already in articles.
+    """
+    urls = [art_url for *_ , art_url in candidates]
+    if not urls:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url FROM articles WHERE url = ANY(%s)",
+            (urls,)
+        )
+        existing = {row[0] for row in cur.fetchall()}
+
+    return [trip for trip in candidates if trip[2] not in existing]
 
 
 def build_article_record(date_str, section_title, art_title, art_url):
@@ -152,11 +206,17 @@ def build_article_record(date_str, section_title, art_title, art_url):
     time.sleep(random.uniform(0.5, 1.2))  # be polite with delays
     try:
         author, content = fetch_article_detail(art_url)
+        if not content:
+            return False, None
+        if content and not is_relevant_article(content):
+            logger.debug("Article not relevant → %s", art_url)
+            return (False, None)
+
     except Exception as e:
         logger.warning("Failed to fetch %s: %s", art_url, e)
-        return None
+        return None, None
 
-    return {
+    return True, {
         "url": art_url,
         "title": f"{section_title} | {art_title}",
         "date": datetime.strptime(date_str, "%Y-%m-%d").date(),
@@ -193,17 +253,19 @@ def scrape_range(start_date: str, end_date: str):
 
         # gather every article that isn’t already in DB
         pending = []
-        for sec_title, sec_url in sections:
-            try:
-                for art_title, art_url in get_articles_in_section(sec_url):
-                    if not article_exists(conn, art_url):
-                        pending.append((sec_title, art_title, art_url))
-            except Exception as e:
-                logger.warning("Error in section %s: %s", sec_url, e)
+        all_articles = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = [pool.submit(fetch_section, sec) for sec in sections]
+            for fut in as_completed(futures):
+                all_articles.extend(fut.result())
 
+        # 2) bulk‐filter by existing URLs
+        pending = filter_new_urls(conn, all_articles)
         logger.info("Found %d new articles for %s", len(pending), day)
         total = len(pending)
         saved = 0
+        
+        articles_to_save = []
         # fetch details in parallel
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = [
@@ -213,10 +275,15 @@ def scrape_range(start_date: str, end_date: str):
             for fut in tqdm(
                 as_completed(futures), total=total, desc=f"Processing {day}", unit="art"
             ):
-                rec = fut.result()
-                if rec:
-                    save_article(conn, rec)
+                is_relevant, rec = fut.result()
+                if is_relevant and rec:
+                    # save_article(conn, rec)
+                    articles_to_save.append(rec)
                     saved += 1
+                    
+        if articles_to_save:
+            save_articles_batch(conn, articles_to_save)        
+
         logger.info("→ Saved %d/%d articles for %s", saved, total, day)
 
         # be polite
@@ -228,4 +295,4 @@ def scrape_range(start_date: str, end_date: str):
 
 if __name__ == "__main__":
     # adjust your desired window here:
-    scrape_range("2010-01-01", "2021-12-31")
+    scrape_range("2016-04-10", "2021-12-31")
